@@ -1,0 +1,103 @@
+# PyTorch PINN model with both h and c as learnable parameters
+
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import matplotlib.pyplot as plt
+
+# Constants
+P = 100           # Power (W)
+# m = 10            # Mass (kg)
+c = 420
+A = 1             # Area (m^2)
+T_env = 25        # Ambient temperature (°C)
+T0 = 20           # Initial temperature (°C)
+t_max = 10000     # Time range (s)
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# Helper: grad function
+def grad(outputs, inputs):
+    return torch.autograd.grad(outputs, inputs, grad_outputs=torch.ones_like(outputs), create_graph=True)[0]
+
+# Analytical solution
+def analytical_T(t, h_val=10, m_val=10):
+    k = (h_val * A) / (m_val* c)
+    T_inf = T_env + P / (h_val * A)
+    return T_inf + (T0 - T_inf) * torch.exp(-k * t)
+
+# Observation data
+t_obs = torch.linspace(0, 1000, 300, device=DEVICE).reshape(-1, 1)
+T_obs = analytical_T(t_obs)
+
+# Model with learnable h and c
+class NetDiscoveryHC(nn.Module):
+    def __init__(self, h_init=5.0, m_init=5):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(1, 50), nn.Tanh(),
+            nn.Linear(50, 50), nn.Tanh(),
+            nn.Linear(50, 1)
+        )
+        self.h_param = nn.Parameter(torch.tensor([h_init], dtype=torch.float32))
+        self.m_param = nn.Parameter(torch.tensor([m_init], dtype=torch.float32))
+
+    def forward(self, t):
+        t_norm = t / t_max
+        return self.net(t_norm)
+
+# Residual loss with h and c
+def thermal_residual_loss(model):
+    t = torch.linspace(0, t_max, 300, device=DEVICE).reshape(-1, 1)
+    t.requires_grad_(True)
+    T = model(t)
+    dTdt = grad(T, t) / t_max
+    h = model.h_param
+    m = model.m_param
+    rhs = P / (m * c) - (h * A) / (m * c) * (T - T_env)
+    return torch.mean((dTdt - rhs) ** 2)
+
+# Train the model
+def train_model(h_init=5.0, m_init=5.0, loss2_weight=1.0, epochs= 10000):
+    model = NetDiscoveryHC(h_init=h_init, m_init=m_init).to(DEVICE)
+    optimizer = optim.Adam(model.parameters(), lr=5e-4)
+    mse = nn.MSELoss()
+
+    for epoch in range(epochs):
+        optimizer.zero_grad()
+        T_pred_obs = model(t_obs)
+        loss_main = mse(T_pred_obs, T_obs)
+        loss_res = thermal_residual_loss(model)
+        loss = loss_main + loss2_weight * loss_res
+        loss.backward()
+        optimizer.step()
+        if epoch % 300 == 0:
+            print(f"Epoch {epoch} | Loss: {loss.item():.5f} | h: {model.h_param.item():.4f} | m: {model.m_param.item():.2f}")
+
+    return model
+
+# Train and evaluate
+model = train_model(h_init=8.0, m_init=5.0)
+
+# Predict
+t_vals = torch.linspace(0, t_max, 200).reshape(-1, 1).to(DEVICE)
+with torch.no_grad():
+    T_preds = model(t_vals).cpu().numpy()
+    T_true = analytical_T(t_vals.cpu(), h_val=10, m_val=10).numpy()
+
+# Plot
+plt.figure(figsize=(10, 5))
+plt.plot(t_vals.cpu().numpy(), T_preds, label="PINN Prediction")
+plt.plot(t_vals.cpu().numpy(), T_true, '--', label="Analytical (h=10, m=10)")
+plt.scatter(t_obs.cpu().numpy(), T_obs.cpu().numpy(), s=10, color='red', label="Observations")
+plt.title(f"Estimated h = {model.h_param.item():.4f}, Estimated m = {model.m_param.item():.2f}")
+plt.xlabel("Time (s)")
+plt.ylabel("Temperature (°C)")
+plt.legend()
+plt.grid()
+plt.tight_layout()
+
+# plot_path = "/mnt/data/pinn_hc_estimation.png"
+# plt.savefig(plot_path)
+# plt.close()
+
+# plot_path, model.h_param.item(), model.c_param.item()
