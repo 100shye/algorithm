@@ -1,0 +1,139 @@
+# Re-execute after environment reset: PINN with np.interp for time-varying P(t)
+
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import numpy as np
+import matplotlib.pyplot as plt
+
+# Constants
+c = 4200
+A = 1
+T_env = 25
+T0 = 20
+t_max = 30000
+t_points = 200
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# Generate random P_series and corresponding time points
+np.random.seed(0)
+t_array = np.linspace(0, t_max, t_points)
+P_series = 1000 + 200 * np.random.rand(t_points)
+
+# Define np.interp-based power function
+def P_interp_np(t_query):
+    return np.interp(t_query, t_array, P_series)
+
+# Wrapper for torch tensors
+def P_t_interp_torch(t_tensor):
+    t_cpu = t_tensor.detach().cpu().numpy().flatten()
+    P_np = P_interp_np(t_cpu)
+    return torch.tensor(P_np, dtype=torch.float32, device=t_tensor.device).reshape(-1, 1)
+
+# True parameters for simulation
+true_h, true_m = 10, 10
+
+# Generate true T_obs using Euler integration
+def generate_T_obs(t_array, h, m):
+    T = np.zeros_like(t_array)
+    T_prev = T0
+    for i in range(len(t_array)):
+        if i == 0:
+            dt = t_array[1] - t_array[0]
+        else:
+            dt = t_array[i] - t_array[i-1]
+        P = P_series[i]
+        dT = (P / (m * c) - (h * A) / (m * c) * (T_prev - T_env)) * dt
+        T_prev += dT
+        T[i] = T_prev
+    return T
+
+T_data_np = generate_T_obs(t_array, true_h, true_m)
+
+# Convert to torch tensors
+t_obs = torch.tensor(t_array, dtype=torch.float32, device=DEVICE).reshape(-1, 1)
+T_obs = torch.tensor(T_data_np, dtype=torch.float32, device=DEVICE).reshape(-1, 1)
+
+# Define PINN model
+class NetPINN(nn.Module):
+    def __init__(self, h_init=5.0, m_init=5.0):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(1, 40), nn.Tanh(),
+            nn.Linear(40, 40), nn.Tanh(),
+            nn.Linear(40, 1)
+        )
+        self.h_param = nn.Parameter(torch.tensor([h_init], dtype=torch.float32))
+        self.m_param = nn.Parameter(torch.tensor([m_init], dtype=torch.float32))
+
+    def forward(self, t):
+        return self.net(t / t_max)
+
+# Residual loss using interpolated P(t)
+def residual_loss(model):
+    t = torch.linspace(0, t_max, t_points, device=DEVICE).reshape(-1, 1)
+    t.requires_grad_(True)
+    T = model(t)
+    dTdt = torch.autograd.grad(T, t, grad_outputs=torch.ones_like(T), create_graph=True)[0] / t_max
+    h = model.h_param
+    m = model.m_param
+    P_vals = P_t_interp_torch(t)
+    T_inf = T_env + P_vals / (h * A)
+    rhs = - (h * A) / (m * c) * (T - T_inf)
+    return torch.mean((dTdt - rhs) ** 2)
+
+# Training
+def train_model(h_init=5.0, m_init=5.0, loss2_weight=1.0, epochs=800):
+    model = NetPINN(h_init=h_init, m_init=m_init).to(DEVICE)
+    optimizer = optim.Adam(model.parameters(), lr=1e-3)
+    mse = nn.MSELoss()
+    for epoch in range(epochs):
+        optimizer.zero_grad()
+        T_pred = model(t_obs)
+        loss_data = mse(T_pred, T_obs)
+        loss_phys = residual_loss(model)
+        loss = loss_data + loss2_weight * loss_phys
+        loss.backward()
+        optimizer.step()
+    return model
+
+model = train_model()
+
+# Evaluate
+t_eval = torch.linspace(0, t_max, 300).reshape(-1, 1).to(DEVICE)
+with torch.no_grad():
+    T_preds = model(t_eval).cpu().numpy()
+
+def generate_T_obs_eval(t_array, h, m):
+    T = np.zeros_like(t_array)
+    T_prev = T0
+    for i in range(len(t_array)):
+        if i == 0:
+            dt = t_array[1] - t_array[0]
+        else:
+            dt = t_array[i] - t_array[i-1]
+        P = P_interp_np(t_array[i])
+        dT = (P / (m * c) - (h * A) / (m * c) * (T_prev - T_env)) * dt
+        T_prev += dT
+        T[i] = T_prev
+    return T
+
+T_true_eval = generate_T_obs_eval(t_eval.cpu().numpy().flatten(), true_h, true_m)
+
+# Plot prediction vs. true
+plt.figure(figsize=(10, 5))
+plt.plot(t_eval.cpu().numpy(), T_true_eval, '--', label=f"True (h={true_h}, m={true_m})")
+plt.plot(t_eval.cpu().numpy(), T_preds, label=f"PINN Prediction")
+plt.scatter(t_array, T_data_np, s=10, color='red', alpha=0.6, label="Observations")
+plt.title(f"PINN with np.interp P(t) | h={model.h_param.item():.2f}, m={model.m_param.item():.2f}")
+plt.xlabel("Time (s)")
+plt.ylabel("Temperature (°C)")
+plt.legend()
+plt.grid()
+plt.tight_layout()
+
+plot_path = "/mnt/data/pinn_interp_vs_truth.png"
+plt.savefig(plot_path)
+plt.close()
+
+plot_path, model.h_param.item(), model.m_param.item()
