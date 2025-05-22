@@ -1,0 +1,161 @@
+# 예측값과 정답 비교
+with torch.no_grad():
+    T_preds = model(t_vals, p_vals)
+    T_true = analytical_T(t_vals.cpu(), p_vals.cpu(), h_val=10, m_val=10)
+    error = torch.abs(T_preds.cpu() - T_true)
+
+# 기준 오차 구간 설정
+baseline_error = error[:100]  # 초기 정상 구간
+mean_e = baseline_error.mean().item()
+std_e = baseline_error.std().item()
+threshold = mean_e + 3 * std_e
+
+# Save updated full script with h clamping, T(0) loss, and dT/dt(0) loss
+updated_script = """
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import matplotlib.pyplot as plt
+
+# Constants
+c = 420
+A = 1
+T_env = 25
+T0 = 20
+t_max = 10000
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+def grad(outputs, inputs):
+    return torch.autograd.grad(outputs, inputs, grad_outputs=torch.ones_like(outputs), create_graph=True)[0]
+
+def power_profile(t_tensor):
+    return 100.0 + 50.0 * torch.sin(2 * torch.pi * t_tensor / 2000.0)
+
+def analytical_T(t, P_val, h_val=10, m_val=10):
+    k = (h_val * A) / (m_val * c)
+    T_inf = T_env + P_val / (h_val * A)
+    return T_inf + (T0 - T_inf) * torch.exp(-k * t)
+
+t_obs = torch.linspace(0, 1000, 300, device=DEVICE).reshape(-1, 1)
+p_obs = power_profile(t_obs)
+T_obs = analytical_T(t_obs, p_obs, h_val=10, m_val=10)
+
+t0_tensor = torch.tensor([[0.0]], dtype=torch.float32, device=DEVICE, requires_grad=True)
+p0_tensor = power_profile(t0_tensor)
+
+class NetDiscoveryHC(nn.Module):
+    def __init__(self, h_init=5.0, m_init=5.0):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(2, 50), nn.Tanh(),
+            nn.Linear(50, 50), nn.Tanh(),
+            nn.Linear(50, 1)
+        )
+        self.h_param = nn.Parameter(torch.tensor([h_init], dtype=torch.float32))
+        self.m_param = nn.Parameter(torch.tensor([m_init], dtype=torch.float32))
+
+    def forward(self, t, p):
+        t_norm = t / t_max
+        p_norm = p / 200.0
+        x = torch.cat([t_norm, p_norm], dim=1)
+        return self.net(x)
+
+def thermal_residual_loss(model):
+    t = torch.linspace(0, t_max, 300, device=DEVICE).reshape(-1, 1)
+    t.requires_grad_(True)
+    p = power_profile(t)
+    T = model(t, p)
+    dTdt = grad(T, t) / t_max
+    h = model.h_param
+    m = model.m_param
+    rhs = p / (m * c) - (h * A) / (m * c) * (T - T_env)
+    return torch.mean((dTdt - rhs) ** 2)
+
+def train_model(h_init=5.0, m_init=5.0, loss2_weight=1.0, epochs=10000):
+    model = NetDiscoveryHC(h_init=h_init, m_init=m_init).to(DEVICE)
+    optimizer = optim.Adam(model.parameters(), lr=5e-4)
+    mse = nn.MSELoss()
+
+    for epoch in range(epochs):
+        optimizer.zero_grad()
+        T_pred_obs = model(t_obs, p_obs)
+        loss_main = mse(T_pred_obs, T_obs)
+        loss_res = thermal_residual_loss(model)
+
+        # Initial condition losses
+        T0_pred = model(t0_tensor, p0_tensor)
+        loss_T0 = mse(T0_pred, torch.tensor([[T0]], device=DEVICE))
+        dTdt0 = grad(T0_pred, t0_tensor) / t_max
+        h = model.h_param
+        m = model.m_param
+        rhs0 = p0_tensor / (m * c) - (h * A) / (m * c) * (T0_pred - T_env)
+        loss_dTdt0 = torch.mean((dTdt0 - rhs0) ** 2)
+
+        # Total loss
+        loss = loss_main + loss2_weight * loss_res + 10.0 * loss_T0 + 10.0 * loss_dTdt0
+        loss.backward()
+        optimizer.step()
+
+        # Clamp h to range [20, 40]
+        with torch.no_grad():
+            model.h_param.clamp_(20.0, 40.0)
+
+        if epoch % 500 == 0:
+            print(f"Epoch {epoch} | Loss: {loss.item():.5f} | h: {model.h_param.item():.4f} | m: {model.m_param.item():.2f}")
+
+    return model
+
+model = train_model(h_init=8.0, m_init=5.0)
+
+t_vals = torch.linspace(0, t_max, 200).reshape(-1, 1).to(DEVICE)
+p_vals = power_profile(t_vals)
+with torch.no_grad():
+    T_preds = model(t_vals, p_vals).cpu().numpy()
+    T_true = analytical_T(t_vals.cpu(), p_vals.cpu(), h_val=10, m_val=10).numpy()
+
+plt.figure(figsize=(10, 5))
+plt.plot(t_vals.cpu().numpy(), T_preds, label="PINN Prediction")
+plt.plot(t_vals.cpu().numpy(), T_true, '--', label="Analytical (h=10, m=10)")
+plt.scatter(t_obs.cpu().numpy(), T_obs.cpu().numpy(), s=10, color='red', label="Observations")
+plt.title(f"Estimated h = {model.h_param.item():.4f}, Estimated m = {model.m_param.item():.2f}")
+plt.xlabel("Time (s)")
+plt.ylabel("Temperature (°C)")
+plt.legend()
+plt.grid()
+plt.tight_layout()
+plt.show()
+
+plt.figure(figsize=(8, 3))
+plt.plot(t_vals.cpu().numpy(), p_vals.cpu().numpy(), label="P(t)", color='orange')
+plt.xlabel("Time (s)")
+plt.ylabel("Power (W)")
+plt.title("Time-varying Power Input")
+plt.grid(True)
+plt.legend()
+plt.tight_layout()
+plt.show()
+"""
+
+with open("/mnt/data/pinn_power_dynamic_clamped_initials.py", "w") as f:
+    f.write(updated_script)
+
+"/mnt/data/pinn_power_dynamic_clamped_initials.py"
+
+
+# 이상 탐지
+anomalies = error > threshold
+
+plt.figure(figsize=(8, 4))
+plt.plot(t_vals.cpu(), error, label="Absolute Error")
+plt.axhline(threshold, color='red', linestyle='--', label=f"Threshold = {threshold:.4f}")
+plt.fill_between(
+    t_vals.cpu().flatten(), threshold, error.flatten(),
+    where=(error.flatten() > threshold), color='orange', alpha=0.3, label="Anomaly"
+)
+plt.xlabel("Time (s)")
+plt.ylabel("|T_pred - T_true|")
+plt.title("Error with Threshold for Anomaly Detection")
+plt.legend()
+plt.grid()
+plt.tight_layout()
+plt.show()
