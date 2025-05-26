@@ -1,0 +1,50 @@
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+# Generate time and power signals
+time = np.arange(0, 20000 + 5, 5)
+power = np.zeros_like(time, dtype=float)
+power_levels = [0, 50, 100, 150, 200]
+for i in range(0, len(time), 20):
+    power[i:i+20] = np.random.choice(power_levels)
+
+# Parameters
+T_env = 25       # ambient temperature (°C)
+T0 = 20          # initial temperature (°C)
+hA = 300         # estimated h * A (W/°C)
+alpha = 0.01     # smoothing factor (acts like thermal inertia)
+
+# Compute T_inf and simulate temperature
+T_inf = T_env + power / hA
+temperature = np.zeros_like(time, dtype=float)
+T = T0
+for i in range(len(time)):
+    T = alpha * T_inf[i] + (1 - alpha) * T
+    temperature[i] = T
+
+# Compile into DataFrame
+df_temp = pd.DataFrame({
+    "time_s": time,
+    "power_W": power,
+    "T_inf": T_inf,
+    "temperature_C": temperature
+})
+
+# Optional: Save to CSV
+df_temp.to_csv("power_to_temperature.csv", index=False)
+
+# Plot
+plt.figure(figsize=(10, 4))
+plt.subplot(2, 1, 1)
+plt.step(time, power, where='post')
+plt.ylabel("Power (W)")
+plt.grid(True)
+
+plt.subplot(2, 1, 2)
+plt.plot(time, temperature, color='orange')
+plt.xlabel("Time (s)")
+plt.ylabel("Temperature (°C)")
+plt.grid(True)
+plt.tight_layout()
+plt.show()
