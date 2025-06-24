@@ -1,0 +1,104 @@
+import pandas as pd
+
+def summarize_log_data(df):
+    # Ensure datetime format
+    df['start_time'] = pd.to_datetime(df['start_time'])
+    df['end_time'] = pd.to_datetime(df['end_time'])
+
+    # Calculate session duration
+    df['duration'] = (df['end_time'] - df['start_time']).dt.total_seconds() / 60  # in minutes
+
+    # Basic summary
+    num_users = df['user_id'].nunique()
+    num_pages = df['page'].nunique()
+    total_sessions = len(df)
+    avg_duration = df['duration'].mean()
+    most_visited_page = df['page'].value_counts().idxmax()
+    most_visited_count = df['page'].value_counts().max()
+
+    # Divide into early, middle, recent
+    sorted_df = df.sort_values('start_time')
+    n = len(sorted_df)
+    early_df = sorted_df.iloc[:n // 3]
+    middle_df = sorted_df.iloc[n // 3:2 * n // 3]
+    recent_df = sorted_df.iloc[2 * n // 3:]
+
+    def get_most_popular_page(sub_df):
+        if sub_df.empty:
+            return "No data"
+        return sub_df['page'].value_counts().idxmax()
+
+    popular_early = get_most_popular_page(early_df)
+    popular_middle = get_most_popular_page(middle_df)
+    popular_recent = get_most_popular_page(recent_df)
+
+    # Summary explanation
+    print("📊 Log Summary Report")
+    print(f"- There are {num_users} unique users.")
+    print(f"- Users visited {num_pages} different pages.")
+    print(f"- A total of {total_sessions} sessions are recorded.")
+    print(f"- The average session duration is {avg_duration:.2f} minutes.")
+    print(f"- The most visited page overall is '{most_visited_page}' with {most_visited_count} visits.")
+    print("\n📈 Popular Pages by Time Segment")
+    print(f"- Early period: most visited page was '{popular_early}'.")
+    print(f"- Middle period: most visited page was '{popular_middle}'.")
+    print(f"- Recent period: most visited page was '{popular_recent}'.")
+
+    # Individual user visit histories
+    print("\n👤 Individual User Visit History:")
+    grouped = df.sort_values('start_time').groupby('user_id')
+    for user_id, group in grouped:
+        print(f"\n- {user_id}'s visit history:")
+        for _, row in group.iterrows():
+            print(f"  • Visited {row['page']} from {row['start_time']} to {row['end_time']}")
+
+    # Return summary dictionary if needed
+    return {
+        'unique_users': num_users,
+        'unique_pages': num_pages,
+        'total_sessions': total_sessions,
+        'average_duration_minutes': avg_duration,
+        'most_visited_page': most_visited_page,
+        'most_visited_count': most_visited_count,
+        'popular_page_early': popular_early,
+        'popular_page_middle': popular_middle,
+        'popular_page_recent': popular_recent,
+        'individual_user_histories': grouped
+    }
+
+
+
+import pandas as pd
+import plotly.express as px
+
+def generate_user_visit_plot(df, output_file='user_visit_history.html'):
+    # Ensure datetime format
+    df['start_time'] = pd.to_datetime(df['start_time'])
+    df['end_time'] = pd.to_datetime(df['end_time'])
+
+    # Combine user and page info for label
+    df['label'] = df['user_id'] + ' | ' + df['page']
+
+    # Plot timeline
+    fig = px.timeline(
+        df,
+        x_start='start_time',
+        x_end='end_time',
+        y='user_id',
+        color='page',
+        hover_data=['page', 'start_time', 'end_time'],
+        title='User Visit History Timeline'
+    )
+
+    # Reverse y-axis to show earliest user on top
+    fig.update_yaxes(autorange="reversed")
+    fig.update_layout(
+        xaxis_title='Time',
+        yaxis_title='User ID',
+        legend_title='Page',
+        height=600
+    )
+
+    # Save to HTML
+    fig.write_html(output_file)
+    print(f"✅ Timeline saved to {output_file}")
