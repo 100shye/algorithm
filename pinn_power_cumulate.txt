@@ -1,0 +1,144 @@
+import torch 
+import torch.nn as nn
+import torch.optim as optim
+import numpy as np
+import matplotlib.pyplot as plt
+
+# === Stepwise Power 생성 ===
+def generate_power(t_array, power_levels=[0, 0,1000,0,0,0,700,0,0, 50000, 0,0,300], min_duration=5, max_duration=20, seed=42):
+    np.random.seed(seed)
+    P_series = np.zeros_like(t_array)
+    current_time = 0
+    idx = 0
+    t_step = t_array[1] - t_array[0]
+    while current_time < t_array[-1]:
+        duration = np.random.uniform(min_duration, max_duration)
+        power = np.random.choice(power_levels)
+        end_time = current_time + duration
+        while idx < len(t_array) and t_array[idx] < end_time:
+            P_series[idx] = power
+            idx += 1
+        current_time = end_time
+    P_series[idx:] = power_levels[0]
+    return P_series
+
+# === Constants ===
+c = 4200
+A = 1
+T_env = 25
+T0 = 100
+t_max = 10000
+t_points = 5000
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# === Power & Time Series ===
+t_array = np.linspace(0, t_max, t_points)
+P_series = generate_power(t_array)
+
+def P_interp_np(t_query): return np.interp(t_query, t_array, P_series)
+def P_t_interp_torch(t_tensor):
+    t_cpu = t_tensor.detach().cpu().numpy().flatten()
+    P_np = P_interp_np(t_cpu)
+    return torch.tensor(P_np, dtype=torch.float32, device=t_tensor.device).reshape(-1, 1)
+
+def simulate_T_from_params(h_val, m_val, t_array_np, P_series_np):
+    T_sim = np.zeros_like(t_array_np)
+    T_prev = T0
+    for i in range(len(t_array_np)):
+        dt = t_array_np[1] - t_array_np[0] if i == 0 else t_array_np[i] - t_array_np[i-1]
+        P = P_series_np[i]
+        dT = (P / (m_val * c) - (h_val * A) / (m_val * c) * (T_prev - T_env)) * dt
+        T_prev += dT
+        T_sim[i] = T_prev
+    return T_sim
+
+# === Observations ===
+true_h, true_m = 10, 10
+T_data_np = simulate_T_from_params(true_h, true_m, t_array, P_series)
+t_obs = torch.tensor(t_array, dtype=torch.float32, device=DEVICE).reshape(-1, 1)
+T_obs = torch.tensor(T_data_np, dtype=torch.float32, device=DEVICE).reshape(-1, 1)
+
+# === PINN Model ===
+class NetPINN(nn.Module):
+    def __init__(self, h_init=5.0, m_init=5.0):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(2, 40), nn.Tanh(),
+            nn.Linear(40, 40), nn.Tanh(),
+            nn.Linear(40, 1)
+        )
+        self.h_param = nn.Parameter(torch.tensor([h_init], dtype=torch.float32))
+        self.m_param = nn.Parameter(torch.tensor([m_init], dtype=torch.float32))
+    def forward(self, t, p):
+        t_scaled = t / t_max
+        p_scaled = p / 2000.0
+        x = torch.cat([t_scaled, p_scaled], dim=1)
+        return self.net(x)
+
+# === Loss Functions ===
+def residual_loss(model):
+    t = torch.linspace(0, t_max, t_points, device=DEVICE).reshape(-1, 1)
+    t.requires_grad_(True)
+    P_vals = P_t_interp_torch(t)
+    T = model(t, P_vals)
+    dTdt = torch.autograd.grad(T, t, grad_outputs=torch.ones_like(T), create_graph=True)[0] / t_max
+    h, m = model.h_param, model.m_param
+    T_inf = T_env + P_vals / (h * A)
+    rhs = - (h * A) / (m * c) * (T - T_inf)
+    return torch.mean((dTdt - rhs) ** 2)
+
+def initial_condition_loss(model):
+    t0 = torch.tensor([[0.0]], device=DEVICE)
+    P0 = P_t_interp_torch(t0)
+    T_hat0 = model(t0, P0)
+    return (T_hat0 - T0) ** 2
+
+def param_regularization(model, λ=10.0):
+    return λ * (torch.relu(-model.h_param)**2 + torch.relu(-model.m_param)**2)
+
+# === Training ===
+def train_model(h_init=5.0, m_init=5.0, loss2_weight=10.0, loss_sim_weight=1.0, epochs=10000):
+    model = NetPINN(h_init=h_init, m_init=m_init).to(DEVICE)
+    optimizer = optim.Adam(model.parameters(), lr=1e-3)
+    mse = nn.MSELoss()
+    for epoch in range(epochs):
+        optimizer.zero_grad()
+        P_vals_obs = P_t_interp_torch(t_obs)
+        T_pred = model(t_obs, P_vals_obs)
+        loss_data = mse(T_pred, T_obs)
+        loss_phys = residual_loss(model)
+        loss_init = initial_condition_loss(model)
+        h_val = model.h_param.clamp(min=1e-3).item()
+        m_val = model.m_param.clamp(min=1e-3).item()
+        T_sim_np = simulate_T_from_params(h_val, m_val, t_array, P_series)
+        T_sim_tensor = torch.tensor(T_sim_np, dtype=torch.float32, device=DEVICE).reshape(-1, 1)
+        loss_sim = mse(T_sim_tensor, T_obs.detach())
+        loss_reg = param_regularization(model)
+        loss = loss_data + loss2_weight * loss_phys + loss_sim_weight * loss_sim + loss_reg + loss_init
+        loss.backward()
+        optimizer.step()
+        if epoch % 500 == 0:
+            print(f"[{epoch:4d}] Loss={loss.item():.4e} | h={model.h_param.item():.4f}, m={model.m_param.item():.4f}")
+    return model
+
+# === Run Training ===
+model = train_model()
+
+# === Evaluate and Plot ===
+t_eval = torch.linspace(0, t_max, 300).reshape(-1, 1).to(DEVICE)
+with torch.no_grad():
+    P_eval = P_t_interp_torch(t_eval)
+    T_preds = model(t_eval, P_eval).cpu().numpy()
+T_true_eval = simulate_T_from_params(true_h, true_m, t_eval.cpu().numpy().flatten(), P_interp_np(t_eval.cpu().numpy().flatten()))
+
+plt.figure(figsize=(10, 5))
+plt.plot(t_eval.cpu().numpy(), T_true_eval, '--', label=f"True (h={true_h}, m={true_m})")
+plt.plot(t_eval.cpu().numpy(), T_preds, label=f"PINN Prediction")
+plt.scatter(t_array, T_data_np, s=10, color='red', alpha=0.6, label="Observations")
+plt.title(f"PINN | h={model.h_param.item():.2f}, m={model.m_param.item():.2f}")
+plt.xlabel("Time (s)")
+plt.ylabel("Temperature (°C)")
+plt.legend()
+plt.grid()
+plt.tight_layout()
+plt.show()
