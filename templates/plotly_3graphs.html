@@ -1,0 +1,28 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Dynamic Plotly 3 Graphs</title>
+    <script src="https://cdn.plot.ly/plotly-latest.min.js"></script>
+</head>
+<body>
+    <h1>Select Graph Type</h1>
+    
+    <form method="get" action="/plotly">
+        <select id="graph_type" name="type" onchange="this.form.submit()">
+            <option value="scatter" {% if graph_type == 'scatter' %}selected{% endif %}>Scatter</option>
+            <option value="box" {% if graph_type == 'box' %}selected{% endif %}>Boxplot</option>
+        </select>
+    </form>
+
+    <div id="graph1"></div>
+    <div id="graph2"></div>
+    <div id="graph3"></div>
+
+    <script>
+        var figures = {{ figures | safe }};
+        Plotly.newPlot('graph1', figures[0].data, figures[0].layout);
+        Plotly.newPlot('graph2', figures[1].data, figures[1].layout);
+        Plotly.newPlot('graph3', figures[2].data, figures[2].layout);
+    </script>
+</body>
+</html>
