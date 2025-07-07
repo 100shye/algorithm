@@ -1,0 +1,174 @@
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import numpy as np
+import matplotlib.pyplot as plt
+import time
+
+# --- Setup and Data Generation (Same as before) ---
+# ... (all the setup code is identical to the previous 'ha' and 'mc' version)
+torch.manual_seed(42); np.random.seed(42)
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+true_ha, true_mc = 10.0, 42000.0; T_env, T0 = 25.0, 100.0
+t_max, t_points = 10000, 500
+t_array_np = np.linspace(0, t_max, t_points)
+P_series_np = generate_power(t_array_np)
+T_data_np = simulate_T_from_params(true_ha, true_mc, t_array_np, P_series_np)
+power_interpolator = PowerInterpolator(t_array_np, P_series_np, DEVICE)
+T_obs_torch = torch.tensor(T_data_np, dtype=torch.float32, device=DEVICE)
+
+# === PHASE 1: GRID SEARCH ===
+
+def simulation_loss(ha_val, mc_val, t_array, P_series, T_obs_np):
+    """Calculates MSE between a simulation and observations."""
+    if mc_val <= 0 or ha_val <= 0:
+        return float('inf') # Penalize invalid parameter values
+        
+    # Run the simple numerical simulation
+    T_sim_np = simulate_T_from_params(ha_val, mc_val, t_array, P_series)
+    
+    # Calculate Mean Squared Error
+    error = np.mean((T_sim_np - T_obs_np)**2)
+    return error
+
+def run_grid_search():
+    print("--- Starting Phase 1: Grid Search ---")
+    start_time = time.time()
+    
+    # Define the search space for ha and mc
+    ha_range = np.linspace(1, 20, 20)          # Search from 1 to 20 for ha
+    mc_range = np.linspace(10000, 80000, 25)  # Search from 10k to 80k for mc
+    
+    best_ha = None
+    best_mc = None
+    min_loss = float('inf')
+    
+    loss_grid = np.zeros((len(ha_range), len(mc_range)))
+
+    # Iterate over the grid
+    for i, ha_val in enumerate(ha_range):
+        for j, mc_val in enumerate(mc_range):
+            loss = simulation_loss(ha_val, mc_val, t_array_np, P_series_np, T_data_np)
+            loss_grid[i, j] = loss
+            if loss < min_loss:
+                min_loss = loss
+                best_ha = ha_val
+                best_mc = mc_val
+    
+    duration = time.time() - start_time
+    print(f"Grid search completed in {duration:.2f} seconds.")
+    print(f"Best initial guess from grid search: ha = {best_ha:.2f}, mc = {best_mc:.2f} (Loss: {min_loss:.4f})")
+    
+    # Optional: Plot the loss landscape
+    plt.figure(figsize=(10, 6))
+    plt.contourf(mc_range, ha_range, np.log10(loss_grid), levels=20, cmap='viridis')
+    plt.colorbar(label='log10(MSE Loss)')
+    plt.xlabel('mc (Total Heat Capacity)')
+    plt.ylabel('ha (Heat Transfer Coefficient * Area)')
+    plt.title('Grid Search Loss Landscape')
+    plt.plot(true_mc, true_ha, 'r*', markersize=15, label='True Parameters')
+    plt.plot(best_mc, best_ha, 'w+', markersize=15, label='Best Grid Search Point')
+    plt.legend()
+    plt.show()
+    
+    return best_ha, best_mc
+
+# Run the search to get our initial parameters
+ha_initial_guess, mc_initial_guess = run_grid_search()
+
+# === PINN Definition (Same as before) ===
+class NetPINN(nn.Module):
+    # ... (identical to previous version)
+    def __init__(self, ha_init=5.0, mc_init=20000.0):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(1, 40), nn.Tanh(),
+            nn.Linear(40, 40), nn.Tanh(),
+            nn.Linear(40, 40), nn.Tanh(),
+            nn.Linear(40, 1)
+        )
+        self.ha_param = nn.Parameter(torch.tensor([ha_init], dtype=torch.float32))
+        self.mc_param = nn.Parameter(torch.tensor([mc_init], dtype=torch.float32))
+    def forward(self, t):
+        return self.net(t / t_max)
+
+def pde_residual(model, t_collocation, power_interp):
+    # ... (identical to previous version)
+    t_collocation.requires_grad_(True)
+    T = model(t_collocation)
+    dT_dt = torch.autograd.grad(T, t_collocation, grad_outputs=torch.ones_like(T), create_graph=True)[0]
+    ha = model.ha_param; mc = model.mc_param
+    P = power_interp(t_collocation)
+    residual = mc * dT_dt - P + ha * (T - T_env)
+    return torch.mean(residual**2)
+
+
+# === PHASE 2: PINN Training with Manual Gradient Scaling ===
+
+def train_pinn_fine_tune(ha_init, mc_init, epochs=20000, lr=1e-4, lambda_phys=1e-10):
+    print("\n--- Starting Phase 2: PINN Fine-Tuning ---")
+    
+    # Initialize the model with the best guesses from the grid search
+    model = NetPINN(ha_init=ha_init, mc_init=mc_init).to(DEVICE)
+    
+    optimizer = optim.Adam(model.parameters(), lr=lr)
+    mse_loss = nn.MSELoss()
+
+    t_obs = torch.tensor(t_array_np, dtype=torch.float32, device=DEVICE).reshape(-1, 1)
+    T_obs = torch.tensor(T_data_np, dtype=torch.float32, device=DEVICE).reshape(-1, 1)
+    t_initial = torch.tensor([[0.0]], device=DEVICE)
+    T_initial_true = torch.tensor([[T0]], device=DEVICE)
+
+    for epoch in range(epochs):
+        model.train()
+        optimizer.zero_grad()
+        
+        loss_data = mse_loss(model(t_obs), T_obs)
+        t_collocation = torch.rand(t_points, 1, device=DEVICE) * t_max
+        loss_phys = pde_residual(model, t_collocation, power_interpolator)
+        loss_init = mse_loss(model(t_initial), T_initial_true)
+        loss_reg = torch.relu(-model.ha_param)**2 + torch.relu(-model.mc_param)**2
+        
+        total_loss = loss_data + loss_init + lambda_phys * loss_phys + loss_reg
+
+        # Calculate gradients for all parameters
+        total_loss.backward()
+        
+        # KEY CHANGE: Manual Gradient Scaling
+        with torch.no_grad():
+            if model.mc_param.grad is not None:
+                # Heuristic: The parameter is ~4000x larger, so we make its gradient ~4000x smaller
+                # to produce a similarly-sized update step.
+                mc_scale_factor = 1.0 / 4000.0
+                model.mc_param.grad *= mc_scale_factor
+        
+        # Apply the (now modified) gradients
+        optimizer.step()
+        
+        if epoch % 1000 == 0:
+            ha_display = model.ha_param.clamp(min=0).item()
+            mc_display = model.mc_param.clamp(min=0).item()
+            # We can check the gradient magnitudes to see if our scaling is working
+            ha_grad_norm = model.ha_param.grad.norm().item() if model.ha_param.grad is not None else 0
+            mc_grad_norm = model.mc_param.grad.norm().item() if model.mc_param.grad is not None else 0
+            print(f"Epoch {epoch:5d} | Loss: {total_loss.item():.4e} | "
+                  f"ha: {ha_display:.3f} | mc: {mc_display:.1f} | "
+                  f"Grad Norms (ha/mc): {ha_grad_norm:.2e} / {mc_grad_norm:.2e}")
+            
+    print("\nTraining finished.")
+    print(f"True values:      ha={true_ha:.4f}, mc={true_mc:.1f}")
+    print(f"Predicted values: ha={model.ha_param.item():.4f}, mc={model.mc_param.item():.1f}")
+    return model
+
+# --- Run the Full Workflow ---
+# Phase 1 is run first to get the initial guesses
+# Phase 2 uses those guesses to start the PINN training
+trained_model = train_pinn_fine_tune(
+    ha_initial_guess, 
+    mc_initial_guess,
+    lr=5e-5, # Use a smaller learning rate for fine-tuning
+    epochs=25000
+)
+
+# === Final Plotting (same as before) ===
+# ... plotting code ...
