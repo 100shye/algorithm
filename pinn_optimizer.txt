@@ -1,0 +1,121 @@
+https://github.com/maziarraissi/PINNs
+
+loss_phys: 뉴럴넷 모델의 출력값 T_pred을 dt로 미분해서
+온도변화율 pde 공식값과 비교한다
+예측값의 온도 변화율이 온도 변화 공식을 따르는지 체크
+-> 예측값의 형태가 실제 온도수식의 형태와 유사한지 확인해줌
+
+
+loss_sim
+모델에서 튜닝중인 온도 계수 hc, a, mc를 기준으로
+eluer simulation simulation 수식에 넣어서
+온도값 계산 후 실제 온도랑 차이 비교
+-> 찾아낸 온도계수가 실측 데이터를 설명하는지 체크.
+->모델에서 찾아는 계수의 정확성을 높여줌.
+
+
+# In train_model function
+# L-BFGS is often used after an initial run with Adam
+
+
+# === L-BFGS Training (Hybrid Approach) ===
+
+def train_model(h_init=5.0, m_init=5.0, adam_epochs=8000, lbfgs_epochs=2000, loss_sim_weight=20.0, loss_phys_weight=10.0):
+    model = NetPINN(h_init=h_init, m_init=m_init).to(DEVICE)
+    mse = nn.MSELoss()
+
+    # --- STAGE 1: Adam Optimizer ---
+    print("--- Starting Stage 1: Adam Optimizer ---")
+    optimizer_adam = optim.Adam(model.parameters(), lr=1e-3)
+    scheduler = optim.lr_scheduler.ExponentialLR(optimizer_adam, gamma=0.99) # Optional but good
+
+    for epoch in range(adam_epochs):
+        optimizer_adam.zero_grad()
+        
+        P_vals_obs = P_t_interp_torch(t_obs)
+        T_pred = model(t_obs, P_vals_obs)
+        loss_data = mse(T_pred, T_obs)
+        
+        loss_phys = residual_loss(model)
+        loss_init = initial_condition_loss(model)
+
+        h_val = model.h_param.clamp(min=1e-3).item()
+        m_val = model.m_param.clamp(min=1e-3).item()
+        T_sim_np = simulate_T_from_params(h_val, m_val, t_array, P_series)
+        T_sim_tensor = torch.tensor(T_sim_np, dtype=torch.float32, device=DEVICE).reshape(-1, 1)
+        loss_sim = mse(T_sim_tensor, T_obs.detach())
+        
+        loss_reg = param_regularization(model)
+        
+        loss = loss_data + loss_phys_weight * loss_phys + loss_sim_weight * loss_sim + loss_reg + loss_init
+        
+        loss.backward()
+        optimizer_adam.step()
+        
+        # Optionally decay learning rate
+        if epoch % 100 == 0:
+            scheduler.step()
+
+        if epoch % 500 == 0:
+            print(f"[Adam Epoch {epoch:4d}] Loss={loss.item():.4e} | h={model.h_param.item():.4f}, m={model.m_param.item():.4f}")
+
+    # --- STAGE 2: L-BFGS Optimizer ---
+    print("\n--- Starting Stage 2: L-BFGS Optimizer for fine-tuning ---")
+    optimizer_lbfgs = optim.LBFGS(
+        model.parameters(), 
+        lr=0.1,  # A higher LR is common for L-BFGS, it's adjusted by the line search
+        max_iter=20, # Number of iterations per optimizer.step() call
+        max_eval=None, # Default is max_iter * 1.25
+        tolerance_grad=1e-7, 
+        tolerance_change=1e-9, 
+        history_size=100,
+        line_search_fn="strong_wolfe" # Recommended for stability
+    )
+
+    # The 'closure' function is required by L-BFGS.
+    # It re-evaluates the model and returns the loss.
+    def closure():
+        optimizer_lbfgs.zero_grad()
+        
+        P_vals_obs = P_t_interp_torch(t_obs)
+        T_pred = model(t_obs, P_vals_obs)
+        loss_data = mse(T_pred, T_obs)
+        
+        loss_phys = residual_loss(model)
+        loss_init = initial_condition_loss(model)
+
+        h_val = model.h_param.clamp(min=1e-3).item()
+        m_val = model.m_param.clamp(min=1e-3).item()
+        T_sim_np = simulate_T_from_params(h_val, m_val, t_array, P_series)
+        T_sim_tensor = torch.tensor(T_sim_np, dtype=torch.float32, device=DEVICE).reshape(-1, 1)
+        loss_sim = mse(T_sim_tensor, T_obs.detach())
+        
+        loss_reg = param_regularization(model)
+        
+        loss = loss_data + loss_phys_weight * loss_phys + loss_sim_weight * loss_sim + loss_reg + loss_init
+        
+        loss.backward()
+        # We need a global or nonlocal variable to track the loss for printing
+        global current_loss 
+        current_loss = loss.item()
+        return loss
+
+    for epoch in range(lbfgs_epochs):
+        # The optimizer.step() function takes the closure and performs multiple
+        # internal iterations (defined by max_iter)
+        optimizer_lbfgs.step(closure)
+        
+        if epoch % 50 == 0:
+             # Using the global variable we set in the closure
+            print(f"[L-BFGS Epoch {epoch:4d}] Loss={current_loss:.4e} | h={model.h_param.item():.4f}, m={model.m_param.item():.4f}")
+
+    return model
+
+# To run the code:
+current_loss = 0 # Initialize the global variable
+model = train_model()
+
+# The training loop is simpler
+for epoch in range(lbfgs_epochs):
+    optimizer.step(closure)
+    # Logging would be done inside the closure or after the step
